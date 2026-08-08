@@ -5,6 +5,7 @@ import JsonTree from './JsonTree.vue';
 import PropertiesGrid from './PropertiesGrid.vue';
 import MessageBox from './MessageBox.vue';
 import ContextMenu from './ContextMenu.vue';
+import PageTabs from './PageTabs.vue';
 import {
   buildRoot,
   parseJson,
@@ -23,26 +24,72 @@ import {
 
 const ABOUT_TEXT = '如果觉得好用,请按Ctrl+D收藏！谢谢！';
 
-const inputText = ref('');
-const root = ref(buildRoot(null));
-const selectedId = ref(null);
-const searchTerm = ref('');
-const matches = ref([]);
-const matchIndex = ref(-1);
+// 全局（跨页面共享）弹窗状态
 const message = ref(null);
 const menu = ref(null);
 const menuItems = ref([]);
 const toast = ref(null);
 let toastTimer = null;
 
+// ---- 页面管理：每个页面持有自己的 JSON 编辑状态 ----
+let pageSeq = 0;
+function createPage(name) {
+  pageSeq += 1;
+  return {
+    id: `page-${pageSeq}`,
+    name: name || `页面 ${pageSeq}`,
+    inputText: '',
+    root: buildRoot(null),
+    selectedId: null,
+    searchTerm: '',
+    matches: [],
+    matchIndex: -1,
+  };
+}
+
+const pages = ref([createPage()]);
+const activePageId = ref(pages.value[0].id);
+
+const activePage = computed(
+  () => pages.value.find((p) => p.id === activePageId.value) ?? pages.value[0]
+);
+
+function selectPage(id) {
+  activePageId.value = id;
+}
+
+function addPage() {
+  const page = createPage();
+  pages.value.push(page);
+  activePageId.value = page.id;
+}
+
+function closePage(id) {
+  const idx = pages.value.findIndex((p) => p.id === id);
+  if (idx === -1) return;
+  const wasActive = activePageId.value === id;
+  pages.value.splice(idx, 1);
+  // 至少保留一个页面
+  if (pages.value.length === 0) {
+    pages.value.push(createPage());
+  }
+  if (wasActive) {
+    activePageId.value = pages.value[Math.min(idx, pages.value.length - 1)].id;
+  }
+}
+
 const selectedNode = computed(() =>
-  selectedId.value ? findById(root.value, selectedId.value) : null
+  activePage.value.selectedId
+    ? findById(activePage.value.root, activePage.value.selectedId)
+    : null
 );
 const gridRows = computed(() => getGridRows(selectedNode.value));
 
-const matchIds = computed(() => matches.value.map((m) => m.id));
+const matchIds = computed(() => activePage.value.matches.map((m) => m.id));
 const currentMatchId = computed(() =>
-  matchIndex.value >= 0 ? (matches.value[matchIndex.value]?.id ?? null) : null
+  activePage.value.matchIndex >= 0
+    ? (activePage.value.matches[activePage.value.matchIndex]?.id ?? null)
+    : null
 );
 
 function showToast(text) {
@@ -63,16 +110,17 @@ async function copyText(text, label) {
 }
 
 function handleFormat() {
+  const page = activePage.value;
   try {
-    const parsed = parseJson(inputText.value);
+    const parsed = parseJson(page.inputText);
     // 美化源文本（2 空格缩进，保留数字字面量）。
-    inputText.value = formatJsonText(inputText.value);
+    page.inputText = formatJsonText(page.inputText);
     const newRoot = buildRoot(parsed);
-    root.value = newRoot;
-    selectedId.value = newRoot.id;
-    matches.value = [];
-    matchIndex.value = -1;
-    searchTerm.value = '';
+    page.root = newRoot;
+    page.selectedId = newRoot.id;
+    page.matches = [];
+    page.matchIndex = -1;
+    page.searchTerm = '';
   } catch {
     message.value = {
       title: '提示',
@@ -83,52 +131,55 @@ function handleFormat() {
 }
 
 function handleAction(action) {
+  const page = activePage.value;
   switch (action) {
     case 'copy':
-      copyText(inputText.value, '复制成功');
+      copyText(page.inputText, '复制成功');
       break;
     case 'format':
       handleFormat();
       break;
     case 'remove-space':
-      inputText.value = inputText.value.replace(/\s+/g, '');
+      page.inputText = page.inputText.replace(/\s+/g, '');
       break;
     case 'remove-space-escape':
-      inputText.value = JSON.stringify(inputText.value.replace(/\s+/g, ''));
+      page.inputText = JSON.stringify(page.inputText.replace(/\s+/g, ''));
       break;
     case 'remove-escape': {
-      inputText.value = (() => {
+      page.inputText = (() => {
         try {
-          const v = JSON.parse(inputText.value);
-          return typeof v === 'string' ? v : inputText.value;
+          const v = JSON.parse(page.inputText);
+          return typeof v === 'string' ? v : page.inputText;
         } catch {
-          return inputText.value.replace(/\\(["\\/bfnrt])/g, '$1');
+          return page.inputText.replace(/\\(["\\/bfnrt])/g, '$1');
         }
       })();
       break;
     }
     case 'expand-all':
-      root.value = expandAll(root.value);
+      page.root = expandAll(page.root);
       break;
     case 'collapse-all':
-      root.value = collapseAll(root.value);
+      page.root = collapseAll(page.root);
       break;
   }
 }
 
 function handleToggle(id) {
-  root.value = root.value ? toggleNode(root.value, id) : root.value;
+  const page = activePage.value;
+  page.root = page.root ? toggleNode(page.root, id) : page.root;
 }
 
 function handleSelect(id) {
-  selectedId.value = id;
+  activePage.value.selectedId = id;
 }
 
 function runSearch(term, startFrom) {
-  const results = searchNodes(root.value, term);
-  matches.value = results;
+  const page = activePage.value;
+  const results = searchNodes(page.root, term);
+  page.matches = results;
   if (results.length === 0) {
-    matchIndex.value = -1;
+    page.matchIndex = -1;
     if (term.trim()) {
       message.value = {
         title: '提示',
@@ -139,30 +190,32 @@ function runSearch(term, startFrom) {
     return;
   }
   // 展开包含匹配的分支，让命中项可见。
-  root.value = mapNode(root.value, (n) =>
+  page.root = mapNode(page.root, (n) =>
     subtreeMatches(n, term) ? { ...n, expanded: true } : n
   );
   const idx = startFrom >= 0 ? startFrom : 0;
-  matchIndex.value = idx;
-  selectedId.value = results[idx].id;
+  page.matchIndex = idx;
+  page.selectedId = results[idx].id;
 }
 
 function handleSearchGo() {
-  runSearch(searchTerm.value.trim(), 0);
+  runSearch(activePage.value.searchTerm.trim(), 0);
 }
 
 function handleNextMatch() {
-  if (matches.value.length === 0) return;
-  const idx = (matchIndex.value + 1) % matches.value.length;
-  matchIndex.value = idx;
-  selectedId.value = matches.value[idx].id;
+  const page = activePage.value;
+  if (page.matches.length === 0) return;
+  const idx = (page.matchIndex + 1) % page.matches.length;
+  page.matchIndex = idx;
+  page.selectedId = page.matches[idx].id;
 }
 
 function handlePrevMatch() {
-  if (matches.value.length === 0) return;
-  const idx = (matchIndex.value - 1 + matches.value.length) % matches.value.length;
-  matchIndex.value = idx;
-  selectedId.value = matches.value[idx].id;
+  const page = activePage.value;
+  if (page.matches.length === 0) return;
+  const idx = (page.matchIndex - 1 + page.matches.length) % page.matches.length;
+  page.matchIndex = idx;
+  page.selectedId = page.matches[idx].id;
 }
 
 function handleAbout() {
@@ -187,10 +240,18 @@ function handleContextAction(action) {
       copyText(`${key}: ${value}`, '复制成功');
       break;
     case 'expand-children':
-      root.value = setNodeExpanded(root.value, menu.value.node.id, true);
+      activePage.value.root = setNodeExpanded(
+        activePage.value.root,
+        menu.value.node.id,
+        true
+      );
       break;
     case 'collapse-children':
-      root.value = setNodeExpanded(root.value, menu.value.node.id, false);
+      activePage.value.root = setNodeExpanded(
+        activePage.value.root,
+        menu.value.node.id,
+        false
+      );
       break;
   }
 }
@@ -226,39 +287,48 @@ onUnmounted(() => window.removeEventListener('click', closeMenu));
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col md:flex-row">
-    <div class="h-[40vh] md:h-full md:w-[400px]">
-      <JsonInputPanel
-        :value="inputText"
-        @text-change="inputText = $event"
-        @action="handleAction"
-      />
-    </div>
-    <div class="ext-split hidden md:block" />
-    <div class="flex h-[45vh] min-w-0 flex-1 flex-col md:h-full">
-      <div class="min-h-0 flex-1">
-        <JsonTree
-          :root="root"
-          :selected-id="selectedId"
-          :search-term="searchTerm"
-          :match-ids="matchIds"
-          :current-match-id="currentMatchId"
-          @search-change="searchTerm = $event"
-          @search-go="handleSearchGo"
-          @next-match="handleNextMatch"
-          @prev-match="handlePrevMatch"
-          @toggle="handleToggle"
-          @select="handleSelect"
-          @expand-all="root = expandAll(root)"
-          @collapse-all="root = collapseAll(root)"
-          @about="handleAbout"
-          @context-menu="openContextMenu"
+  <div class="flex h-full min-h-0 flex-col">
+    <PageTabs
+      :pages="pages"
+      :active-id="activePageId"
+      @select="selectPage"
+      @add="addPage"
+      @close="closePage"
+    />
+    <div class="flex min-h-0 flex-1 flex-col md:flex-row">
+      <div class="h-[40vh] md:h-full md:w-[400px]">
+        <JsonInputPanel
+          :value="activePage.inputText"
+          @text-change="activePage.inputText = $event"
+          @action="handleAction"
         />
       </div>
-    </div>
-    <div class="ext-split hidden md:block" />
-    <div class="h-[30vh] md:h-full md:w-[300px]">
-      <PropertiesGrid :rows="gridRows" />
+      <div class="ext-split hidden md:block" />
+      <div class="flex h-[45vh] min-w-0 flex-1 flex-col md:h-full">
+        <div class="min-h-0 flex-1">
+          <JsonTree
+            :root="activePage.root"
+            :selected-id="activePage.selectedId"
+            :search-term="activePage.searchTerm"
+            :match-ids="matchIds"
+            :current-match-id="currentMatchId"
+            @search-change="activePage.searchTerm = $event"
+            @search-go="handleSearchGo"
+            @next-match="handleNextMatch"
+            @prev-match="handlePrevMatch"
+            @toggle="handleToggle"
+            @select="handleSelect"
+            @expand-all="activePage.root = expandAll(activePage.root)"
+            @collapse-all="activePage.root = collapseAll(activePage.root)"
+            @about="handleAbout"
+            @context-menu="openContextMenu"
+          />
+        </div>
+      </div>
+      <div class="ext-split hidden md:block" />
+      <div class="h-[30vh] md:h-full md:w-[300px]">
+        <PropertiesGrid :rows="gridRows" />
+      </div>
     </div>
 
     <MessageBox v-if="message" :data="message" />
